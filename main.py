@@ -1,39 +1,333 @@
 import os
-import time
+import json
 import secrets
-from datetime import datetime, timedelta
+import numpy as np
+import onnxruntime as ort
 import psycopg2
 from psycopg2 import pool
-from fastapi import FastAPI, HTTPException, Request, Depends, status, Header
+from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, constr, conlist
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from cachetools import TTLCache
-import torch
-from transformers import pipeline
+from transformers import AutoTokenizer
 from contextlib import asynccontextmanager
 
 # ==============================================================================
-# 1. CONFIGURAÇÕES E OTIMIZAÇÕES DE INFRAESTRUTURA
+# 1. CONFIGURAÇÕES E INFRAESTRUTURA
 # ==============================================================================
-
-# Otimização para CPU na Render (Evita disputa de threads e OOM)
-torch.set_num_threads(2)
-torch.set_grad_enabled(False)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/synapse")
 MAX_TOKENS_MONTH = 10_000_000
 MIN_TOKEN_COST = 10
+MODEL_DIR = "./synapse_langid_onnx"  # Pasta onde o modelo ONNX foi exportado
 
-# Cache em RAM para evitar bater no banco a cada requisição (TTL 5 minutos)
 auth_cache = TTLCache(maxsize=1000, ttl=300)
-
-# Inicialização do Pool de Conexões psycopg2
 db_pool = None
 
-# Carregamento do Modelo HuggingFace
+# Variáveis globais para o ONNX
+tokenizer = None
+ort_session = None
+id2label = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db_pool, tokenizer, ort_session, id2label
+    
+    # 1. Conecta ao PostgreSQL
+    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=DATABASE_URL)
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    api_key VARCHAR(64) PRIMARY KEY,
+                    ip_address VARCHAR(45) UNIQUE NOT NULL,
+                    monthly_quota BIGINT DEFAULT 10000000,
+                    tokens_used BIGINT DEFAULT 0,
+                    period_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status VARCHAR(20) DEFAULT 'active'
+                )
+            """)
+            conn.commit()
+    finally:
+        db_pool.putconn(conn)
+        
+    # 2. Carrega o Tokenizer e o Config
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+    
+    with open(os.path.join(MODEL_DIR, "config.json"), "r") as f:
+        config = json.load(f)
+        # O id2label JSON tem chaves como string, precisamos converter para inteiro
+        id2label = {int(k): v for k, v in config.get("id2label", {}).items()}
+    
+    # 3. Inicializa o ONNX Runtime (Otimizado para CPU da Render)
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = 2
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    
+    ort_session = ort.InferenceSession(
+        os.path.join(MODEL_DIR, "model.onnx"), 
+        sess_options=opts, 
+        providers=["CPUExecutionProvider"]
+    )
+    
+    yield
+    
+    if db_pool:
+        db_pool.closeall()
+
+# Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(lifespan=lifespan, title="Synapse-LangID API", version="4.3.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ==============================================================================
+# 2. MIDDLEWARES E DEPENDÊNCIAS DE AUTENTICAÇÃO
+# ==============================================================================
+
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    if request.headers.get("content-length"):
+        if int(request.headers["content-length"]) > 256000:
+            return JSONResponse(status_code=413, content={"detail": "Payload Too Large (Max 256KB)"})
+    return await call_next(request)
+
+def get_db_connection():
+    conn = db_pool.getconn()
+    try:
+        yield conn
+    finally:
+        db_pool.putconn(conn)
+
+def estimar_tokens(text: str) -> int:
+    chars = len(text)
+    estimated = max(MIN_TOKEN_COST, chars // 4 + (1 if chars % 4 else 0))
+    return estimated
+
+def verificar_autenticacao(
+    request: Request, 
+    x_api_key: str = Header(None, alias="x-api-key"),
+    key: str = None,
+    conn = Depends(get_db_connection)
+):
+    api_key = x_api_key or key
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API Key ausente")
+        
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE api_keys 
+            SET tokens_used = 0, period_start = CURRENT_TIMESTAMP
+            WHERE api_key = %s AND period_start + INTERVAL '30 days' <= CURRENT_TIMESTAMP
+            RETURNING tokens_used, monthly_quota, status
+        """, (api_key,))
+        conn.commit()
+
+    if api_key in auth_cache:
+        account = auth_cache[api_key]
+    else:
+        with conn.cursor() as cur:
+            cur.execute("SELECT tokens_used, monthly_quota, status FROM api_keys WHERE api_key = %s", (api_key,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=401, detail="Chave inválida")
+            account = {"tokens_used": row[0], "monthly_quota": row[1], "status": row[2]}
+            auth_cache[api_key] = account
+
+    if account["status"] != "active":
+        raise HTTPException(status_code=403, detail="Chave inativa ou revogada")
+        
+    if account["tokens_used"] >= account["monthly_quota"]:
+        raise HTTPException(status_code=429, detail="Cota mensal excedida (10.000.000 tokens)")
+
+    return api_key
+
+# ==============================================================================
+# 3. VALIDAÇÃO DE PAYLOAD E MOTOR DE INFERÊNCIA
+# ==============================================================================
+
+class PredictRequest(BaseModel):
+    text: constr(min_length=2, max_length=1500)
+
+class BatchPredictRequest(BaseModel):
+    texts: conlist(constr(min_length=2, max_length=1500), min_length=1, max_length=30)
+
+def rodar_inferencia_onnx(texts: list[str]):
+    inputs = tokenizer(
+        texts, padding=True, truncation=True, max_length=256, return_tensors="np"
+    )
+    ort_inputs = {
+        "input_ids": inputs["input_ids"],
+        "attention_mask": inputs["attention_mask"]
+    }
+    
+    logits = ort_session.run(None, ort_inputs)[0]
+    
+    # Softmax otimizado via NumPy
+    exp_logits = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+    probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
+    
+    predictions = []
+    for prob in probs:
+        idx = int(np.argmax(prob))
+        score = float(prob[idx])
+        label = id2label.get(idx, str(idx))
+        predictions.append({"language": label, "confidence": round(score, 4)})
+        
+    return predictions
+
+# ==============================================================================
+# 4. ENDPOINTS DA API
+# ==============================================================================
+
+@app.get("/")
+@limiter.limit("20/minute")
+async def health_check(request: Request):
+    return {
+        "status": "Online",
+        "database": "Conectado" if db_pool else "Desconectado",
+        "model": "Carregado (ONNX Runtime)" if ort_session else "Carregando"
+    }
+
+@app.post("/gerar-chave")
+@limiter.limit("3/hour")
+async def gerar_chave(request: Request, conn = Depends(get_db_connection)):
+    ip_addr = request.client.host
+    new_key = f"syn_{secrets.token_hex(8)}"
+    
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO api_keys (api_key, ip_address) VALUES (%s, %s)",
+                (new_key, ip_addr)
+            )
+            conn.commit()
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("SELECT api_key FROM api_keys WHERE ip_address = %s", (ip_addr,))
+            existing_key = cur.fetchone()[0]
+        raise HTTPException(status_code=400, detail=f"IP já possui chave: {existing_key}")
+
+    return {"message": "Chave gerada!", "api_key": new_key}
+
+@app.post("/v1/predict")
+@limiter.limit("30/minute")
+async def predict(
+    request: Request, 
+    payload: PredictRequest, 
+    conn = Depends(get_db_connection),
+    api_key: str = Depends(verificar_autenticacao)
+):
+    cost = estimar_tokens(payload.text)
+    
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE api_keys SET tokens_used = tokens_used + %s 
+            WHERE api_key = %s RETURNING tokens_used, monthly_quota
+        """, (cost, api_key))
+        updated_used, quota = cur.fetchone()
+        conn.commit()
+        
+    if updated_used > quota:
+        raise HTTPException(status_code=429, detail="Requisição excede a cota mensal restante.")
+
+    auth_cache.pop(api_key, None)
+
+    # Inferencia super rápida na CPU
+    predictions = rodar_inferencia_onnx([payload.text])
+
+    response = JSONResponse({
+        "prediction": predictions[0],
+        "usage": {
+            "prompt_tokens": cost,
+            "remaining_tokens": quota - updated_used
+        }
+    })
+    response.headers["x-ratelimit-remaining-tokens"] = str(quota - updated_used)
+    return response
+
+@app.post("/v1/predict-batch")
+@limiter.limit("6/minute")
+async def predict_batch(
+    request: Request, 
+    payload: BatchPredictRequest,
+    conn = Depends(get_db_connection),
+    api_key: str = Depends(verificar_autenticacao)
+):
+    total_chars = sum(len(t) for t in payload.texts)
+    if total_chars > 15000:
+        raise HTTPException(status_code=413, detail="Lote excede o limite cumulativo de 15.000 caracteres.")
+        
+    cost = sum(estimar_tokens(t) for t in payload.texts)
+    
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE api_keys SET tokens_used = tokens_used + %s 
+            WHERE api_key = %s RETURNING tokens_used, monthly_quota
+        """, (cost, api_key))
+        updated_used, quota = cur.fetchone()
+        conn.commit()
+        
+    if updated_used > quota:
+        raise HTTPException(status_code=429, detail="Requisição excede a cota mensal restante.")
+        
+    auth_cache.pop(api_key, None)
+
+    predictions = rodar_inferencia_onnx(payload.texts)
+
+    response = JSONResponse({
+        "count": len(payload.texts),
+        "predictions": predictions,
+        "usage": {
+            "prompt_tokens": cost,
+            "remaining_tokens": quota - updated_used
+        }
+    })
+    response.headers["x-ratelimit-remaining-tokens"] = str(quota - updated_used)
+    return response
+
+@app.get("/v1/key-info")
+@limiter.limit("15/minute")
+async def key_info(request: Request, conn = Depends(get_db_connection), api_key: str = Depends(verificar_autenticacao)):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT ip_address, monthly_quota, tokens_used, period_start, status 
+            FROM api_keys WHERE api_key = %s
+        """, (api_key,))
+        row = cur.fetchone()
+        
+    return {
+        "key_prefix": f"{api_key[:8]}...",
+        "status": row[4],
+        "monthly_quota": row[1],
+        "tokens_used": row[2],
+        "tokens_remaining": row[1] - row[2],
+        "period_start": row[3].isoformat(),
+        "registered_ip": row[0]
+    }
+
+@app.delete("/v1/revoke-key")
+@limiter.limit("5/hour")
+async def revoke_key(request: Request, conn = Depends(get_db_connection), api_key: str = Depends(verificar_autenticacao)):
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM api_keys WHERE api_key = %s", (api_key,))
+        conn.commit()
+        
+    auth_cache.pop(api_key, None)
+    return {"message": "Chave revogada com sucesso. O IP está liberado."}
+
+@app.get("/v1/languages")
+async def languages():
+    return {
+        "model": "Comunidade-Synapse-BR/Synapse-LangID (ONNX)",
+        "batch_supported": True,
+        "max_batch_size": 30
+    }
 langid_pipeline = None
 
 @asynccontextmanager
