@@ -3,6 +3,10 @@ uvicorn[standard]
 onnxruntime
 huggingface_hub
 transformers
+tokenizers
 numpy
 psycopg2-binary
 slowapi
+cachetools
+pydantic
+typing-extensions
