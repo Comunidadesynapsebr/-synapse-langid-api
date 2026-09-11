@@ -1,116 +1,171 @@
-from fastapi import FastAPI, HTTPException, Query, Request
+import os
+import secrets
+import psycopg2
+from fastapi import FastAPI, HTTPException, Depends, Request, status
+from fastapi.security import APIKeyQuery, APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List
 from transformers import pipeline
-
-# Bibliotecas para proteção Anti-Spam/Flood (Rate Limiting)
 from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
-# Configura o limitador para bloquear pelo IP do usuário
-limiter = Limiter(key_func=get_remote_address)
+# ==========================================
+# 🗄️ CONEXÃO COM O BANCO NEON
+# ==========================================
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-app = FastAPI(
-    title="Synapse-LangID API",
-    description="API protegida contra Flood para identificação de idioma da Comunidade Synapse BR",
-    version="1.2.0"
-)
+def get_db_connection():
+    if not DATABASE_URL:
+        return None
+    return psycopg2.connect(DATABASE_URL)
 
-# Adiciona o escudo na aplicação para retornar Erro 429 se alguém fizer spam
+def init_db():
+    conn = get_db_connection()
+    if conn:
+        with conn.cursor() as cur:
+            # Cria a tabela de chaves automaticamente
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    ip TEXT PRIMARY KEY,
+                    key TEXT UNIQUE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.commit()
+        conn.close()
+
+# Tenta criar a tabela ao iniciar a API
+try:
+    init_db()
+except Exception as e:
+    print(f"Erro ao inicializar banco de dados: {e}")
+
+# ==========================================
+# 🛡️ SEGURANÇA E AUTENTICAÇÃO
+# ==========================================
+MASTER_KEY = os.getenv("SYNAPSE_MASTER_KEY", "master-123")
+
+api_key_query = APIKeyQuery(name="key", auto_error=False)
+api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+
+def get_real_ip(request: Request) -> str:
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip: return cf_ip
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded: return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "127.0.0.1"
+
+def verify_api_key(api_key_query: str = Depends(api_key_query), api_key_header: str = Depends(api_key_header)):
+    key = api_key_query or api_key_header
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Acesso Negado: Chave ausente.",
+        )
+    
+    # Permite acesso irrestrito para o administrador
+    if key == MASTER_KEY:
+        return key
+
+    # Verifica se a chave do usuário existe no banco Neon
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Banco de dados indisponível.")
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT key FROM api_keys WHERE key = %s;", (key,))
+            row = cur.fetchone()
+            if row:
+                return key
+    finally:
+        conn.close()
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Acesso Negado: Chave inválida ou não registrada.",
+    )
+
+limiter = Limiter(key_func=get_real_ip)
+
+# ==========================================
+# 🚀 INICIALIZAÇÃO DA API
+# ==========================================
+app = FastAPI(title="Synapse-LangID Enterprise Auth", version="4.0.0")
+
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Carrega o pipeline do modelo otimizado para CPU
+# Carrega o modelo de IA
 MODEL_ID = "Comunidade-Synapse-BR/Synapse-LangID"
-
 try:
-    classifier = pipeline(
-        "text-classification",
-        model=MODEL_ID,
-        device=-1
-    )
-except Exception as e:
+    classifier = pipeline("text-classification", model=MODEL_ID, device=-1)
+except Exception:
     classifier = None
-    print(f"Erro ao carregar o modelo: {e}")
 
-# Schemas com limitação de "Tokens/Caracteres" para evitar travamento da RAM
-class SinglePredictRequest(BaseModel):
-    # Bloqueia textos maiores que 2000 caracteres
-    text: str = Field(..., max_length=2000, description="Texto com no máximo 2000 caracteres")
+class PredictRequest(BaseModel):
+    text: str = Field(..., max_length=1500)
 
-class BatchPredictRequest(BaseModel):
-    # Permite no máximo 20 frases de uma vez no envio em lote
-    texts: List[str] = Field(..., max_length=20, description="Máximo de 20 textos por requisição")
-
-
+# ==========================================
+# 🌐 ENDPOINTS
+# ==========================================
 @app.get("/")
-@limiter.limit("20/minute") # Permite 20 acessos por minuto no ping
+@limiter.limit("10/minute")
 def health_check(request: Request):
-    return {
-        "status": "online",
-        "model": MODEL_ID,
-        "loaded": classifier is not None,
-        "security": "Rate Limiting ATIVADO"
-    }
+    return {"status": "Online", "database": "Neon PostgreSQL Conectado"}
 
+@app.post("/gerar-chave")
+@limiter.limit("5/minute")
+def gerar_chave(request: Request):
+    ip = get_real_ip(request)
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Banco de dados indisponível.")
 
-@app.post("/predict")
-@limiter.limit("15/minute") # Limite: 15 predições por minuto por IP
-def predict_language(request: Request, payload: SinglePredictRequest):
+    try:
+        with conn.cursor() as cur:
+            # Trava 1: Verifica se o IP já criou uma chave antes
+            cur.execute("SELECT key FROM api_keys WHERE ip = %s;", (ip,))
+            row = cur.fetchone()
+            if row:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Este IP já possui uma chave ativa: {row[0]}"
+                )
+
+            # Gera a chave e salva no banco definitivamente
+            nova_chave = "syn_" + secrets.token_hex(8)
+            cur.execute("INSERT INTO api_keys (ip, key) VALUES (%s, %s);", (ip, nova_chave))
+            conn.commit()
+
+        return {"message": "Chave gerada e salva com sucesso!", "api_key": nova_chave}
+    finally:
+        conn.close()
+
+@app.post("/v1/predict", dependencies=[Depends(verify_api_key)])
+@limiter.limit("15/minute")
+def predict_secure(request: Request, payload: PredictRequest):
     if not classifier:
-        raise HTTPException(status_code=500, detail="Modelo não carregado.")
+        raise HTTPException(status_code=500, detail="Modelo Offline.")
     if not payload.text.strip():
-        raise HTTPException(status_code=400, detail="O texto não pode ser vazio.")
+        raise HTTPException(status_code=400, detail="Texto vazio.")
 
     try:
-        results = classifier(payload.text)
+        result = classifier(payload.text)[0]
         return {
-            # Corta a resposta visual se o texto for gigante (para economizar banda)
-            "input": payload.text[:50] + "..." if len(payload.text) > 50 else payload.text,
-            "prediction": results[0]
+            "prediction": {
+                "language": result["label"],
+                "confidence": result["score"]
+            }
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro na inferência: {str(e)}")
-
-
-@app.post("/predict/batch")
-@limiter.limit("5/minute") # Limite rígido (5 por minuto) pois processa muitos dados
-def predict_batch(request: Request, payload: BatchPredictRequest):
-    if not classifier:
-        raise HTTPException(status_code=500, detail="Modelo não carregado.")
-    
-    clean_texts = [t for t in payload.texts if t.strip()]
-    if not clean_texts:
-        raise HTTPException(status_code=400, detail="A lista de textos não pode ser vazia.")
-
-    try:
-        results = classifier(clean_texts)
-        output = [
-            {"input": text[:50] + "..." if len(text) > 50 else text, "prediction": res}
-            for text, res in zip(clean_texts, results)
-        ]
-        return {
-            "total": len(output),
-            "results": output
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro na inferência em lote: {str(e)}")
-
-
-@app.get("/detect")
-@limiter.limit("15/minute") # Limite: 15 predições rápidas por minuto por IP
-def detect_quick(request: Request, text: str = Query(..., max_length=2000, description="Texto para identificar")):
-    if not classifier:
-        raise HTTPException(status_code=500, detail="Modelo não carregado.")
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="O parâmetro 'text' não pode estar vazio.")
-
-    try:
-        results = classifier(text)
-        return {
-            "input": text[:50] + "..." if len(text) > 50 else text,
-            "prediction": results[0]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro na inferência: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
