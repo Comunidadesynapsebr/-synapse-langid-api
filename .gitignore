@@ -1,0 +1,21 @@
+# Ambientes virtuais
+venv/
+env/
+.env
+
+# Cache do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Arquivos temporários e logs
+*.log
+.pytest_cache/
+
+# Ignorar pesos de modelos caso você baixe localmente por engano
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.h5
