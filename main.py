@@ -1,280 +1,246 @@
-import os
-import time
-import secrets
-import psycopg2
-from psycopg2 import pool
-import torch
-from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.security import APIKeyQuery, APIKeyHeader
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List
-from transformers import pipeline
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
+================================================================================
+SYNAPSE-LANGID API - DOCUMENTACAO TECNICA E GUIA DE INTEGRACAO
+================================================================================
 
-# ==========================================
-# ⚙️ OTIMIZAÇÃO EXTREMA DE CPU (PYTORCH)
-# ==========================================
-# Trava o uso de núcleos para evitar fila na Render e desliga o motor de treino
-torch.set_num_threads(2)
-torch.set_grad_enabled(False)
+Descricao:
+API corporativa para identificacao automatica de idioma em textos com base no
+modelo Transformer "Comunidade-Synapse-BR/Synapse-LangID".
+Inclui autenticacao persistente via PostgreSQL, cache em memoria RAM,
+pooling de conexoes, rate limiting por IP e suporte a inferencia em lote.
 
-# ==========================================
-# 🗄️ POOL DE CONEXÕES PERSISTENTE
-# ==========================================
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip().replace("\r", "").replace("\n", "").replace(" ", "").replace("postgres://", "postgresql://")
+Base URL:
+https://synapse-langid-api.onrender.com
 
-db_pool = None
-if DATABASE_URL:
-    try:
-        db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=5, dsn=DATABASE_URL)
-        print("Pool de conexões PostgreSQL iniciado com sucesso.")
-    except Exception as e:
-        print(f"Erro crítico ao inicializar pool do banco: {e}")
+Versao: 4.2.0
 
-def get_db_conn():
-    if db_pool:
-        return db_pool.getconn()
-    return None
 
-def release_db_conn(conn):
-    if db_pool and conn:
-        db_pool.putconn(conn)
+================================================================================
+1. AUTENTICACAO
+================================================================================
 
-def init_db():
-    conn = get_db_conn()
-    if conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS api_keys (
-                        ip TEXT PRIMARY KEY,
-                        key TEXT UNIQUE NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                """)
-                conn.commit()
-            print("Tabela api_keys verificada.")
-        except Exception as e:
-            print(f"Erro ao inicializar tabela: {e}")
-        finally:
-            release_db_conn(conn)
+A maioria dos endpoints exige envio de uma API Key valida.
+Voce pode enviar a chave de duas formas equivalentes:
 
-init_db()
+A) Via Query Parameter:
+   https://synapse-langid-api.onrender.com/v1/predict?key=SUA_CHAVE_AQUI
 
-# ==========================================
-# ⚡ CACHE EM RAM (ZERO OVERHEAD DE BANCO)
-# ==========================================
-KEY_CACHE = {}
-CACHE_TTL = 300  # 5 minutos
+B) Via Header HTTP:
+   x-api-key: SUA_CHAVE_AQUI
 
-def is_key_cached(key: str) -> bool:
-    exp = KEY_CACHE.get(key)
-    return bool(exp and exp > time.time())
+Regra de Geracao:
+Cada endereco IP tem direito a apenas 1 chave ativa registrada no banco de
+dados. Para emitir uma nova chave, a anterior deve ser revogada antes.
 
-def cache_key(key: str):
-    KEY_CACHE[key] = time.time() + CACHE_TTL
 
-def invalidate_cache(key: str):
-    KEY_CACHE.pop(key, None)
+================================================================================
+2. ENDPOINTS DA API
+================================================================================
 
-# ==========================================
-# 🛡️ SEGURANÇA E AUTENTICAÇÃO
-# ==========================================
-MASTER_KEY = os.getenv("SYNAPSE_MASTER_KEY", "master-123")
-api_key_query = APIKeyQuery(name="key", auto_error=False)
-api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+--------------------------------------------------------------------------------
+[GET] /
+--------------------------------------------------------------------------------
+Health Check do servico. Verifica se a API esta no ar, se o pool com o banco de
+dados esta conectado e se o modelo Transformer esta carregado na memoria.
 
-def get_real_ip(request: Request) -> str:
-    cf_ip = request.headers.get("cf-connecting-ip")
-    if cf_ip: return cf_ip
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded: return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "127.0.0.1"
+- Autenticacao: Nao requer
+- Rate Limit: 20 chamadas/minuto
+- Exemplo de Resposta (Status 200):
+  {
+    "status": "Online",
+    "database": "Conectado",
+    "model": "Carregado"
+  }
 
-def verify_api_key(api_key_query: str = Depends(api_key_query), api_key_header: str = Depends(api_key_header)):
-    key = api_key_query or api_key_header
-    if not key:
-        raise HTTPException(status_code=401, detail="Acesso Negado: Chave ausente.")
-    
-    if key == MASTER_KEY:
-        return key
+--------------------------------------------------------------------------------
+[POST] /gerar-chave
+--------------------------------------------------------------------------------
+Gera e armazena uma credencial unica (prefixo 'syn_') associada ao IP de origem.
 
-    # 1. Checa RAM primeiro (0ms)
-    if is_key_cached(key):
-        return key
+- Autenticacao: Nao requer
+- Rate Limit: 5 chamadas/minuto
+- Exemplo de Resposta (Status 200 - Sucesso):
+  {
+    "message": "Chave gerada!",
+    "api_key": "syn_85b21db93babe995"
+  }
+- Exemplo de Resposta (Status 400 - IP ja cadastrado):
+  {
+    "detail": "IP já possui chave: syn_85b21db93babe995"
+  }
 
-    # 2. Se não estiver na RAM, vai no Banco usando o Pool
-    conn = get_db_conn()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Banco de dados indisponível.")
+--------------------------------------------------------------------------------
+[POST] /v1/predict
+--------------------------------------------------------------------------------
+Realiza a identificacao de idioma de uma unica string de texto.
 
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT key FROM api_keys WHERE key = %s;", (key,))
-            if cur.fetchone():
-                cache_key(key)  # Salva na RAM para as próximas chamadas
-                return key
-    finally:
-        release_db_conn(conn)
-
-    raise HTTPException(status_code=401, detail="Chave inválida ou revogada.")
-
-limiter = Limiter(key_func=get_real_ip)
-
-# ==========================================
-# 🚀 INICIALIZAÇÃO DA API
-# ==========================================
-app = FastAPI(title="Synapse-LangID Enterprise Auth", version="4.2.0")
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(SlowAPIMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-MODEL_ID = "Comunidade-Synapse-BR/Synapse-LangID"
-try:
-    classifier = pipeline("text-classification", model=MODEL_ID, device=-1)
-except Exception:
-    classifier = None
-
-class PredictRequest(BaseModel):
-    text: str = Field(..., max_length=1500, description="Texto único para identificação")
-
-class BatchPredictRequest(BaseModel):
-    texts: List[str] = Field(..., max_items=50, description="Lista de até 50 textos")
-
-# ==========================================
-# 🌐 ENDPOINTS PÚBLICOS
-# ==========================================
-@app.get("/")
-@limiter.limit("20/minute")
-def health_check(request: Request):
-    db_status = "Conectado" if db_pool else "Desconectado"
-    return {"status": "Online", "database": db_status, "model": "Carregado" if classifier else "Offline"}
-
-@app.post("/gerar-chave")
-@limiter.limit("5/minute")
-def gerar_chave(request: Request):
-    ip = get_real_ip(request)
-    conn = get_db_conn()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Banco indisponível.")
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT key FROM api_keys WHERE ip = %s;", (ip,))
-            row = cur.fetchone()
-            if row:
-                raise HTTPException(status_code=400, detail=f"IP já possui chave: {row[0]}")
-
-            nova_chave = "syn_" + secrets.token_hex(8)
-            cur.execute("INSERT INTO api_keys (ip, key) VALUES (%s, %s);", (ip, nova_chave))
-            conn.commit()
-
-        cache_key(nova_chave)
-        return {"message": "Chave gerada!", "api_key": nova_chave}
-    finally:
-        release_db_conn(conn)
-
-# ==========================================
-# 🔒 ENDPOINTS PROTEGIDOS
-# ==========================================
-@app.post("/v1/predict", dependencies=[Depends(verify_api_key)])
-@limiter.limit("30/minute")
-def predict_secure(request: Request, payload: PredictRequest):
-    if not classifier:
-        raise HTTPException(status_code=500, detail="Modelo Offline.")
-    if not payload.text.strip():
-        raise HTTPException(status_code=400, detail="Texto vazio.")
-
-    # Inferência isolada e ultrarrápida
-    with torch.inference_mode():
-        result = classifier(payload.text)[0]
-
-    return {
-        "prediction": {
-            "language": result["label"],
-            "confidence": round(result["score"], 4)
-        }
+- Autenticacao: Obrigatoria (via param 'key' ou header 'x-api-key')
+- Rate Limit: 30 chamadas/minuto
+- Limite de caracteres: Maximo de 1.500 caracteres por texto
+- Content-Type: application/json
+- Formato do Payload (Body):
+  {
+    "text": "Esta frase confirma se a deteccao de idioma esta funcionando."
+  }
+- Exemplo de Resposta (Status 200):
+  {
+    "prediction": {
+      "language": "pt",
+      "confidence": 0.9986
     }
+  }
 
-@app.post("/v1/predict-batch", dependencies=[Depends(verify_api_key)])
-@limiter.limit("10/minute")
-def predict_batch(request: Request, payload: BatchPredictRequest):
-    """Processa vários textos em uma única requisição (Alta Performance)."""
-    if not classifier:
-        raise HTTPException(status_code=500, detail="Modelo Offline.")
-    if not payload.texts:
-        raise HTTPException(status_code=400, detail="Lista vazia.")
+--------------------------------------------------------------------------------
+[POST] /v1/predict-batch
+--------------------------------------------------------------------------------
+Processa multiplas frases em uma unica requisicao de rede utilizando
+inferencia paralela em memoria. Recomendado para processamento massivo.
 
-    clean_texts = [t[:1500] for t in payload.texts if t.strip()]
-    if not clean_texts:
-        raise HTTPException(status_code=400, detail="Textos inválidos.")
+- Autenticacao: Obrigatoria (via param 'key' ou header 'x-api-key')
+- Rate Limit: 10 chamadas/minuto
+- Limite de lote: Ate 50 textos por chamada
+- Content-Type: application/json
+- Formato do Payload (Body):
+  {
+    "texts": [
+      "Ola, tudo bem com voce?",
+      "Artificial intelligence is transforming software engineering.",
+      "Bonjour tout le monde."
+    ]
+  }
+- Exemplo de Resposta (Status 200):
+  {
+    "count": 3,
+    "predictions": [
+      { "language": "pt", "confidence": 0.9985 },
+      { "language": "en", "confidence": 0.9794 },
+      { "language": "fr", "confidence": 0.9912 }
+    ]
+  }
 
-    with torch.inference_mode():
-        # O modelo processa a lista inteira de uma só vez na memória
-        raw_results = classifier(clean_texts, batch_size=8)
+--------------------------------------------------------------------------------
+[GET] /v1/key-info
+--------------------------------------------------------------------------------
+Consulta as informacoes cadastrais e timestamp de criacao da chave atual.
 
-    results = [{"language": res["label"], "confidence": round(res["score"], 4)} for res in raw_results]
-    return {"count": len(results), "predictions": results}
+- Autenticacao: Obrigatoria (via param 'key' ou header 'x-api-key')
+- Rate Limit: 15 chamadas/minuto
+- Exemplo de Resposta (Status 200):
+  {
+    "key_prefix": "syn_85b...",
+    "registered_ip": "136.114.188.162",
+    "created_at": "2026-09-11 14:15:42",
+    "status": "active"
+  }
 
-@app.get("/v1/key-info", dependencies=[Depends(verify_api_key)])
-@limiter.limit("15/minute")
-def info_chave(request: Request, key: str = Depends(verify_api_key)):
-    if key == MASTER_KEY:
-        return {"key": "MASTER_KEY", "type": "admin", "status": "active"}
+--------------------------------------------------------------------------------
+[DELETE] /v1/revoke-key
+--------------------------------------------------------------------------------
+Exclui a chave ativa do PostgreSQL e expira o cache em memoria imediatamente,
+liberando o IP para gerar uma credencial nova.
 
-    conn = get_db_conn()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Banco indisponível.")
+- Autenticacao: Obrigatoria (via param 'key' ou header 'x-api-key')
+- Rate Limit: 5 chamadas/minuto
+- Exemplo de Resposta (Status 200):
+  {
+    "message": "Chave revogada. Seu IP está liberado."
+  }
 
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT ip, created_at FROM api_keys WHERE key = %s;", (key,))
-            row = cur.fetchone()
-            if row:
-                return {
-                    "key_prefix": key[:7] + "...",
-                    "registered_ip": row[0],
-                    "created_at": row[1].strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "active"
-                }
-    finally:
-        release_db_conn(conn)
-    
-    raise HTTPException(status_code=404, detail="Não encontrado.")
+--------------------------------------------------------------------------------
+[GET] /v1/languages
+--------------------------------------------------------------------------------
+Retorna os metadados do modelo de IA e recursos suportados.
 
-@app.delete("/v1/revoke-key", dependencies=[Depends(verify_api_key)])
-@limiter.limit("5/minute")
-def revogar_chave(request: Request, key: str = Depends(verify_api_key)):
-    if key == MASTER_KEY:
-        raise HTTPException(status_code=403, detail="A MASTER_KEY não pode ser revogada.")
+- Autenticacao: Nao requer
+- Exemplo de Resposta (Status 200):
+  {
+    "model": "Comunidade-Synapse-BR/Synapse-LangID",
+    "batch_supported": true,
+    "max_batch_size": 50
+  }
 
-    conn = get_db_conn()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Banco indisponível.")
 
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM api_keys WHERE key = %s;", (key,))
-            conn.commit()
-        invalidate_cache(key)
-        return {"message": "Chave revogada. Seu IP está liberado."}
-    finally:
-        release_db_conn(conn)
+================================================================================
+3. EXEMPLOS DE IMPLEMENTACAO EM CODIGO
+================================================================================
 
-@app.get("/v1/languages")
-def listar_idiomas(request: Request):
-    return {
-        "model": MODEL_ID,
-        "batch_supported": True,
-        "max_batch_size": 50
-    }
+----------------------------------------
+Exemplo em Python (requests):
+----------------------------------------
+import requests
+
+BASE_URL = "https://synapse-langid-api.onrender.com"
+API_KEY = "SUA_CHAVE_AQUI"
+
+headers = {
+    "x-api-key": API_KEY,
+    "Content-Type": "application/json"
+}
+
+# 1. Chamada Individual
+payload_individual = {"text": "Texto em portugues para ser analisado."}
+res1 = requests.post(f"{BASE_URL}/v1/predict", json=payload_individual, headers=headers)
+print("Individual:", res1.json())
+
+# 2. Chamada em Lote (Batch)
+payload_lote = {
+    "texts": [
+        "Frase de teste em portugues.",
+        "A sample sentence written in English."
+    ]
+}
+res2 = requests.post(f"{BASE_URL}/v1/predict-batch", json=payload_lote, headers=headers)
+print("Lote:", res2.json())
+
+
+----------------------------------------
+Exemplo em JavaScript / Node.js (fetch):
+----------------------------------------
+const API_KEY = "SUA_CHAVE_AQUI";
+
+async function classificarTexto(texto) {
+  const url = "https://synapse-langid-api.onrender.com/v1/predict";
+  const resposta = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": API_KEY
+    },
+    body: JSON.stringify({ text: texto })
+  });
+  
+  const dados = await resposta.json();
+  console.log(dados);
+}
+
+classificarTexto("Checking the language identification API.");
+
+
+----------------------------------------
+Exemplo em cURL (Terminal / Bash):
+----------------------------------------
+curl -X POST "https://synapse-langid-api.onrender.com/v1/predict" \
+     -H "x-api-key: SUA_CHAVE_AQUI" \
+     -H "Content-Type: application/json" \
+     -d '{"text": "Exemplo simples de execucao via cURL no terminal."}'
+
+
+================================================================================
+4. ARQUITETURA INTERNA E OTIMIZACOES APLICADAS
+================================================================================
+
+- Fast Response Cache:
+  As chaves autenticadas sao salvas em um dicionario local em RAM com TTL de
+  5 minutos. Consultas subsequentes de um mesmo usuario nao precisam consultar o
+  disco ou o banco de dados (0 ms de overhead de autenticacao).
+
+- Threaded Connection Pool:
+  Utiliza o pool nativo do psycopg2 para manter conexoes quentes abertas com o
+  PostgreSQL da Render, eliminando atrasos de handshake TCP/TLS.
+
+- CPU Inference Optimization:
+  O pipeline roda sob 'torch.inference_mode()' com numero de threads restrito a 2,
+  impedindo disputas de contexto e superaquecimento da vCPU compartilhada.
+
+- Protecao por SlowAPI:
+  Rate limiting configurado nas bordas para evitar travamento da instancia por
+  denial-of-service (DDoS/spam).
