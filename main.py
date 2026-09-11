@@ -1468,21 +1468,3 @@ async def languages():
             30
 
     }
-
-No Render
-
-Você deve ter estas variáveis:
-
-DATABASE_URL=<Internal Database URL do PostgreSQL>
-TOKENIZER_REPO=<repositório HF que contém o tokenizer>
-HF_REPO=Comunidade-Synapse-BR/Synapse-LangID-ONNX
-
-Não coloque a senha do PostgreSQL dentro do "main.py".
-
-A principal mudança é que agora a cota é reservada de forma atômica no PostgreSQL. Assim, duas requisições simultâneas não conseguem consumir a mesma quantidade restante e ultrapassar os 10 milhões por uma condição de corrida.
-
-Também alterei o "/v1/revoke-key": em vez de apagar a linha, ele marca "status = 'revoked'". Isso preserva o histórico da chave e libera o IP para uma nova chave.
-
-O único ponto que você ainda precisa definir é o "TOKENIZER_REPO", porque o arquivo "model-int8.onnx" sozinho não fornece necessariamente os arquivos necessários para "AutoTokenizer".
-
-E troque a senha do PostgreSQL que você enviou anteriormente, porque ela foi exposta.
