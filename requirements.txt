@@ -1,7 +1,8 @@
-onnxruntime
-huggingface_hub
 fastapi
 uvicorn[standard]
+onnxruntime
+huggingface_hub
 transformers
 numpy
 psycopg2-binary
+slowapi
