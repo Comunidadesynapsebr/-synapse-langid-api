@@ -255,7 +255,27 @@ def migrar_schema(conn):
 
         cur.execute(
             "ALTER TABLE api_keys "
-            "ADD COLUMN IF NOT EXISTS ip_address VARCHAR(45) UNIQUE"
+            "ADD COLUMN IF NOT EXISTS ip_address VARCHAR(45)"
+        )
+
+        # UNIQUE separado (em vez de inline) pelo mesmo motivo do FK
+        # abaixo: mais seguro de rodar de forma idempotente e mais fácil
+        # de depurar se algo falhar.
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'api_keys_ip_address_key'
+                ) THEN
+                    ALTER TABLE api_keys
+                        ADD CONSTRAINT api_keys_ip_address_key
+                        UNIQUE (ip_address);
+                END IF;
+            END $$;
+            """
         )
 
         cur.execute(
@@ -293,10 +313,51 @@ def migrar_schema(conn):
             """
         )
 
+        # Coluna sem constraint inline — mais seguro/portável do que
+        # "ADD COLUMN ... REFERENCES ..." numa única instrução.
         cur.execute(
             "ALTER TABLE usage_log "
-            "ADD COLUMN IF NOT EXISTS api_key VARCHAR(64) NOT NULL "
-            "REFERENCES api_keys(api_key) ON DELETE CASCADE"
+            "ADD COLUMN IF NOT EXISTS api_key VARCHAR(64)"
+        )
+
+        # FK adicionada à parte, só se ainda não existir. Isso evita o
+        # erro "column referenced in foreign key constraint does not
+        # exist" que algumas instâncias de Postgres (ex.: atrás de
+        # poolers como o do Render) disparam quando a coluna e a FK são
+        # criadas na mesma instrução ADD COLUMN.
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'usage_log_api_key_fkey'
+                ) THEN
+                    ALTER TABLE usage_log
+                        ADD CONSTRAINT usage_log_api_key_fkey
+                        FOREIGN KEY (api_key)
+                        REFERENCES api_keys (api_key)
+                        ON DELETE CASCADE;
+                END IF;
+            END $$;
+            """
+        )
+
+        # NOT NULL aplicado depois que a coluna e a FK já existem —
+        # seguro mesmo em reexecuções (não falha se já não houver NULLs).
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM usage_log WHERE api_key IS NULL
+                ) THEN
+                    ALTER TABLE usage_log
+                        ALTER COLUMN api_key SET NOT NULL;
+                END IF;
+            END $$;
+            """
         )
 
         cur.execute(
